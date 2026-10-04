@@ -59,6 +59,12 @@ MINOR_UNITS = {"GBp": ("GBP", "Pence (GBp)"), "GBX": ("GBP", "Pence (GBp)"),
                "ZAc": ("ZAR", "Cents (ZAc)"), "ILA": ("ILS", "Agorot (ILA)")}
 
 
+MAJOR_UNITS = {"GBP": "Pounds (GBP)", "USD": "US dollars", "EUR": "Euros", "CAD": "Canadian dollars",
+               "HKD": "Hong Kong dollars", "CHF": "Swiss francs", "AUD": "Australian dollars",
+               "JPY": "Japanese yen", "SEK": "Swedish kronor", "NOK": "Norwegian kroner",
+               "DKK": "Danish kroner", "ZAR": "Rand"}
+
+
 class Yahoo:
     """Throttled client for Yahoo's public endpoints with 429 backoff."""
 
@@ -149,7 +155,11 @@ def name_tokens(s):
 
 
 def names_match(ours, yahoo):
-    if name_tokens(ours) & name_tokens(yahoo):
+    ta, tb = name_tokens(ours), name_tokens(yahoo)
+    if ta & tb:
+        return True
+    # Renamed after a merger: "ATAI Life Sciences" vs "AtaiBeckley Inc."
+    if any(len(a) >= 4 and b.startswith(a) for a in ta for b in tb):
         return True
     # Abbreviations: "ABF" vs "Associated British Foods plc"
     initials = "".join(w[0] for w in re.findall(r"[a-z0-9]+", (yahoo or "").lower()) if w not in STOPWORDS)
@@ -184,27 +194,39 @@ def resolve_row(yh, isin, ticker, name):
     else:
         notes.append("ISIN not found on Yahoo (may be an old ISIN after a corporate action)")
 
-    # b. ISIN search found a listing of the same ticker on its home exchange
-    #    (e.g. AF.PA, ASML.AS). Skip foreign secondary listings like Mexico.
-    for q in quotes:
-        if q["symbol"].split(".")[0].replace("-", "") == t.replace("-", "") and not q["symbol"].endswith(".MX"):
-            meta, df = fetch(q["symbol"])
-            if meta is not None:
-                return dict(symbol=q["symbol"], method="ISIN match (other exchange)", quotes=quotes, notes=notes, meta=meta, df=df)
+    def isin_other_exchange():
+        # ISIN search found the same ticker on its home exchange (e.g. AF.PA,
+        # ASML.AS). Skip foreign secondary listings like Mexico.
+        for q in quotes:
+            if q["symbol"].split(".")[0].replace("-", "") == t.replace("-", "") and not q["symbol"].endswith(".MX"):
+                meta, df = fetch(q["symbol"])
+                if meta is not None:
+                    return dict(symbol=q["symbol"], method="ISIN match (other exchange)", quotes=quotes, notes=notes, meta=meta, df=df)
 
-    # c. Ticker exists on the preferred exchange and the name agrees.
-    for c in prefs:
-        meta, df = fetch(c)
-        if meta is not None and df is not None and len(df) and names_match(name, meta.get("longName") or meta.get("shortName")):
-            return dict(symbol=c, method="Ticker + name match", quotes=quotes, notes=notes, meta=meta, df=df)
+    def ticker_and_name():
+        # Ticker exists on the preferred exchange and the name agrees.
+        for c in prefs:
+            meta, df = fetch(c)
+            if meta is not None and df is not None and len(df) and names_match(name, meta.get("longName") or meta.get("shortName")):
+                return dict(symbol=c, method="Ticker + name match", quotes=quotes, notes=notes, meta=meta, df=df)
 
-    # d. Ticker exists on the ISIN's preferred exchange but the name doesn't
-    #    obviously match - keep it, flag it. Never jump to the other exchange
-    #    here: "GOOD" in the US is a different company from "GOOD.L".
-    meta, df = fetch(prefs[0])
-    if meta is not None and df is not None and len(df):
-        notes.append("Name differs from Yahoo's - please verify")
-        return dict(symbol=prefs[0], method="Ticker only - verify", quotes=quotes, notes=notes, meta=meta, df=df)
+    # b/c. UK/Irish/Jersey-type ISINs are held in London, so the London line
+    # wins over e.g. a Swiss listing of the same ETF. Elsewhere the ISIN's own
+    # home listing wins.
+    steps = (ticker_and_name, isin_other_exchange) if country in LONDON_FIRST else (isin_other_exchange, ticker_and_name)
+    for step in steps:
+        found = step()
+        if found:
+            return found
+
+    # d. Ticker exists on the ISIN's home exchange (US or London only) but the
+    #    name doesn't obviously match - keep it, flag it. Not done for other
+    #    countries: "MARA" in the US is not Marubeni, and "GOOD" is not GOOD.L.
+    if country == "US" or country in LONDON_FIRST:
+        meta, df = fetch(prefs[0])
+        if meta is not None and df is not None and len(df):
+            notes.append("Name differs from Yahoo's - please verify")
+            return dict(symbol=prefs[0], method="Ticker only - verify", quotes=quotes, notes=notes, meta=meta, df=df)
 
     # e. Fall back to whatever the ISIN search found.
     for q in quotes:
@@ -232,9 +254,7 @@ def describe(res, today):
     else:
         status = f"Not trading since {last:%Y-%m-%d} (likely delisted/suspended)"
     yccy = meta.get("currency") or ""
-    ccy, unit = MINOR_UNITS.get(yccy, (yccy.upper(), "Major units" if yccy else ""))
-    if yccy == "GBP":
-        unit = "Pounds (GBP)"
+    ccy, unit = MINOR_UNITS.get(yccy, (yccy.upper(), MAJOR_UNITS.get(yccy, yccy)))
     itype = meta.get("instrumentType") or ""
     out.update({
         "Status": status,
