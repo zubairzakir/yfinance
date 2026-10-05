@@ -1,9 +1,9 @@
-"""Build hourly / daily (or any bar size) open-high-low-close-volume from the 1-minute files.
+"""Build hourly / daily (or any bar size) open-high-low-close-volume from minute_prices.csv.
 
 Usage (from the Tickers_4Oct26 folder):
-    python make_views.py NVDA 1h            # hourly bars for NVDA -> views/NVDA_1h.csv
+    python make_views.py NVDA 1h            # hourly bars for NVDA -> NVDA_1h.csv
     python make_views.py NVDA 1d            # daily bars
-    python make_views.py all 1h             # every stock, one file each
+    python make_views.py all 1h             # every stock, in one file -> all_1h.csv
     python make_views.py GSK.L 15min --from 2026-10-01 --to 2026-10-31
     python make_views.py NVDA 1h --regular  # regular session only (no pre/post-market)
 
@@ -14,12 +14,12 @@ auction trading; daily_prices.csv has the official daily figures.
 """
 
 import argparse
-import glob
 import os
 
 import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+MINUTES = None
 FREQ = {"5min": "5min", "15min": "15min", "30min": "30min", "1h": "1h", "1d": "1D", "1w": "W-FRI"}
 
 
@@ -35,7 +35,7 @@ def sessions(sym):
 
 
 def view(sym, size, start, end, regular):
-    m = pd.read_csv(os.path.join(HERE, "minute", f"{sym}.csv"))
+    m = MINUTES[MINUTES["Yahoo Symbol"] == sym]
     if m.empty:
         return m
     utc = pd.to_datetime(m["Time (UTC)"], utc=True)
@@ -77,18 +77,23 @@ def main():
     ap.add_argument("--regular", action="store_true", help="regular session only")
     args = ap.parse_args()
 
-    syms = ([os.path.basename(p)[:-4] for p in sorted(glob.glob(os.path.join(HERE, "minute", "*.csv")))]
-            if args.symbol.lower() == "all" else [args.symbol])
-    os.makedirs(os.path.join(HERE, "views"), exist_ok=True)
+    global MINUTES
+    MINUTES = pd.read_csv(os.path.join(HERE, "minute_prices.csv"))
+    syms = sorted(MINUTES["Yahoo Symbol"].unique()) if args.symbol.lower() == "all" else [args.symbol]
+    out_rows = []
     for sym in syms:
-        try:
-            bars = view(sym, args.size, args.start, args.end, args.regular)
-        except FileNotFoundError:
-            print(f"{sym}: no minute file yet")
+        bars = view(sym, args.size, args.start, args.end, args.regular)
+        if bars.empty:
+            print(f"{sym}: no minute data")
             continue
-        out = os.path.join(HERE, "views", f"{sym}_{args.size}{'_regular' if args.regular else ''}.csv")
-        bars.round(6).to_csv(out)
-        print(f"{sym}: {len(bars)} bars -> {os.path.relpath(out, HERE)}")
+        out_rows.append(bars.round(6).reset_index().assign(**{"Yahoo Symbol": sym}))
+    if not out_rows:
+        return
+    name = f"{'all' if args.symbol.lower() == 'all' else args.symbol}_{args.size}{'_regular' if args.regular else ''}.csv"
+    out = os.path.join(HERE, name)
+    df = pd.concat(out_rows)
+    df[["Yahoo Symbol"] + [c for c in df.columns if c != "Yahoo Symbol"]].to_csv(out, index=False)
+    print(f"{len(df)} bars for {len(out_rows)} instruments -> {name}")
 
 
 if __name__ == "__main__":

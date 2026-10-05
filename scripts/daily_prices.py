@@ -7,7 +7,8 @@ Reads the instruments from Tickers_4Oct26_updated.xlsx (rows with Status
                           open, high, low, close, adjusted close and volume
                           (including auction volume), dividend, split, and
                           change from the previous close.
-  minute/<SYMBOL>.csv     Every 1-minute bar, including pre/post-market.
+  minute_prices.csv       Every 1-minute bar for every instrument, including
+                          pre/post-market, all in one file.
 
 Each run continues from the last day / minute already saved for each
 instrument, up to 30 minutes before now (Yahoo delays some exchanges). On the
@@ -23,6 +24,7 @@ Usage (from the folder holding the spreadsheet):
 import argparse
 import csv
 import datetime as dt
+import glob
 import json
 import os
 import sys
@@ -35,7 +37,9 @@ import requests
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPREADSHEET = os.path.join(HERE, "Tickers_4Oct26_updated.xlsx")
 OUTPUT = os.path.join(HERE, "daily_prices.csv")
-MINUTE_DIR = os.path.join(HERE, "minute")
+MINUTE_FILE = os.path.join(HERE, "minute_prices.csv")
+PROGRESS = os.path.join(HERE, ".minute_progress.json")
+OLD_MINUTE_DIR = os.path.join(HERE, "minute")  # earlier version: one file per stock
 LOG = os.path.join(HERE, "daily_prices.log")
 LOCK = os.path.join(HERE, ".daily_prices.lock")
 CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{}"
@@ -48,7 +52,7 @@ UTC = dt.timezone.utc
 COLUMNS = ["Trading Date", "Yahoo Symbol", "Name", "Exchange", "Currency", "Price Unit",
            "Open", "High", "Low", "Close", "Adj Close", "Volume", "Previous Close", "Change", "Change %",
            "Dividend", "Stock Split", "Session Open (UTC)", "Session Close (UTC)", "Added At"]
-MINUTE_COLUMNS = ["Time (UTC)", "Exchange Time", "Open", "High", "Low", "Close", "Volume"]
+MINUTE_COLUMNS = ["Yahoo Symbol", "Time (UTC)", "Exchange Time", "Open", "High", "Low", "Close", "Volume"]
 
 
 def log(msg):
@@ -183,20 +187,19 @@ def update_daily(yh, writer, row, have, cutoff, first_run_from, added_at):
 
 # --------------------------------------------------------------- minute bars
 
-def minute_path(sym):
-    return os.path.join(MINUTE_DIR, f"{sym}.csv")
-
-
-PROGRESS = os.path.join(MINUTE_DIR, "_fetched_up_to.json")
-
-
 def load_progress():
     """UTC time up to which each symbol's minute bars have been fetched."""
     try:
         with open(PROGRESS) as f:
             return {k: dt.datetime.fromisoformat(v) for k, v in json.load(f).items()}
     except (OSError, ValueError):
+        pass
+    if not os.path.exists(MINUTE_FILE):
         return {}
+    # Progress file lost: rebuild it from the last bar per symbol in the minute file.
+    df = pd.read_csv(MINUTE_FILE, usecols=["Yahoo Symbol", "Time (UTC)"])
+    last = pd.to_datetime(df.groupby("Yahoo Symbol")["Time (UTC)"].max(), utc=True)
+    return {s: t.to_pydatetime() + dt.timedelta(minutes=1) for s, t in last.items()}
 
 
 def save_progress(progress):
@@ -205,66 +208,68 @@ def save_progress(progress):
     os.replace(PROGRESS + ".tmp", PROGRESS)
 
 
-def last_minute(path):
-    """UTC time of the last bar saved in a minute file, or None."""
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        return None
-    with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        f.seek(max(0, f.tell() - 4096))
-        lines = [ln for ln in f.read().decode("utf-8", "ignore").splitlines() if ln.strip()]
-    try:
-        return dt.datetime.strptime(lines[-1].split(",")[0], "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
-    except (ValueError, IndexError):
-        return None  # only a header so far
+def merge_old_minute_files():
+    """Fold the per-stock files written by the earlier version into minute_prices.csv."""
+    files = sorted(glob.glob(os.path.join(OLD_MINUTE_DIR, "*.csv")))
+    if not files:
+        return
+    progress = {}
+    old_progress = os.path.join(OLD_MINUTE_DIR, "_fetched_up_to.json")
+    if os.path.exists(old_progress):
+        with open(old_progress) as f:
+            progress = {k: dt.datetime.fromisoformat(v) for k, v in json.load(f).items()}
+    new_file = not os.path.exists(MINUTE_FILE)
+    with open(MINUTE_FILE, "a", newline="") as out:
+        w = csv.writer(out)
+        if new_file:
+            w.writerow(MINUTE_COLUMNS)
+        for path in files:
+            sym = os.path.basename(path)[:-4]
+            with open(path, newline="") as f:
+                rows = list(csv.reader(f))[1:]
+            for r in rows:
+                w.writerow([sym] + r)
+            if sym not in progress and rows:
+                progress[sym] = (dt.datetime.strptime(rows[-1][0], "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
+                                 + dt.timedelta(minutes=1))
+    save_progress(progress)
+    os.rename(OLD_MINUTE_DIR, OLD_MINUTE_DIR + "_old_merged_into_minute_prices")
+    log(f"Merged {len(files)} per-stock minute files into {os.path.basename(MINUTE_FILE)} "
+        f"(old folder renamed to minute_old_merged_into_minute_prices - safe to delete)")
 
 
-def update_minutes(yh, sym, end, first_run_from, progress):
-    """Append complete 1-minute bars up to `end` for one instrument.
+def update_minutes(yh, w, sym, end, first_run_from, progress):
+    """Append complete 1-minute bars up to `end` for one instrument via csv writer `w`.
     Returns bars added, or None if a request failed (the rest is retried next run)."""
-    path = minute_path(sym)
-    last = progress.get(sym)
-    if last is None:
-        bar = last_minute(path)  # progress file lost: fall back to the file itself
-        last = bar + dt.timedelta(minutes=1) if bar else None
-    start = last or first_run_from
+    start = progress.get(sym) or first_run_from
     oldest = end - MINUTE_HISTORY
     if start < oldest:
         if start != first_run_from:
             log(f"  {sym}: minute data from {start:%Y-%m-%d %H:%M} to {oldest:%Y-%m-%d %H:%M} UTC "
                 f"is no longer on Yahoo (over 30 days since the last run) - continuing from there")
         start = oldest
-    if start >= end:
-        return 0
     added = 0
-    new_file = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
-        if new_file:
-            w.writerow(MINUTE_COLUMNS)
-        chunk_start = start
-        while chunk_start < end:
-            chunk_end = min(chunk_start + MINUTE_CHUNK, end)
-            res = yh.chart(sym, chunk_start, chunk_end, "1m")
-            if res is None:
-                return None
-            tz = ZoneInfo(res.get("meta", {}).get("exchangeTimezoneName") or "UTC")
-            q = (res.get("indicators", {}).get("quote") or [{}])[0]
-            rows = {}
-            for i, t in enumerate(res.get("timestamp") or []):
-                bar = dt.datetime.fromtimestamp(t, UTC)
-                close = q.get("close", [None])[i]
-                # Only whole minutes inside this window; Yahoo can include a forming bar.
-                if close is None or bar < chunk_start or bar + dt.timedelta(minutes=1) > chunk_end:
-                    continue
-                rows[t] = [bar.strftime("%Y-%m-%d %H:%M"), bar.astimezone(tz).strftime("%Y-%m-%d %H:%M"),
-                           r6(q["open"][i]), r6(q["high"][i]), r6(q["low"][i]), r6(close), q["volume"][i]]
-            for t in sorted(rows):
-                w.writerow(rows[t])
-            added += len(rows)
-            f.flush()
-            progress[sym] = chunk_start = chunk_end
-            save_progress(progress)
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + MINUTE_CHUNK, end)
+        res = yh.chart(sym, chunk_start, chunk_end, "1m")
+        if res is None:
+            return None
+        tz = ZoneInfo(res.get("meta", {}).get("exchangeTimezoneName") or "UTC")
+        q = (res.get("indicators", {}).get("quote") or [{}])[0]
+        rows = {}
+        for i, t in enumerate(res.get("timestamp") or []):
+            bar = dt.datetime.fromtimestamp(t, UTC)
+            close = q.get("close", [None])[i]
+            # Only whole minutes inside this window; Yahoo can include a forming bar.
+            if close is None or bar < chunk_start or bar + dt.timedelta(minutes=1) > chunk_end:
+                continue
+            rows[t] = [sym, bar.strftime("%Y-%m-%d %H:%M"), bar.astimezone(tz).strftime("%Y-%m-%d %H:%M"),
+                       r6(q["open"][i]), r6(q["high"][i]), r6(q["low"][i]), r6(close), q["volume"][i]]
+        for t in sorted(rows):
+            w.writerow(rows[t])
+        added += len(rows)
+        progress[sym] = chunk_start = chunk_end
     return added
 
 
@@ -292,7 +297,7 @@ def main(argv=None, now=None):
 def run(args, now):
     inst = pd.read_excel(SPREADSHEET)
     inst = inst[inst["Status"] == "Listed"].drop_duplicates("Yahoo Symbol")
-    os.makedirs(MINUTE_DIR, exist_ok=True)
+    merge_old_minute_files()
 
     now = now or dt.datetime.now(UTC)
     cutoff = now - SETTLE
@@ -307,18 +312,25 @@ def run(args, now):
 
     yh = Yahoo(args.min_interval)
     new_file = not os.path.exists(OUTPUT)
+    new_minute_file = not os.path.exists(MINUTE_FILE)
     days = minutes = blocked = 0
     failed, t0 = [], time.monotonic()
-    with open(OUTPUT, "a", newline="") as f:
+    with open(OUTPUT, "a", newline="") as f, open(MINUTE_FILE, "a", newline="") as mf:
         w = csv.DictWriter(f, fieldnames=COLUMNS)
+        mw = csv.writer(mf)
         if new_file:
             w.writeheader()
+        if new_minute_file:
+            mw.writerow(MINUTE_COLUMNS)
         for k, (_, row) in enumerate(inst.iterrows(), 1):
             sym = row["Yahoo Symbol"]
             try:
                 d = update_daily(yh, w, row, have, cutoff, first_run_from, added_at)
                 f.flush()
-                m = update_minutes(yh, sym, minute_end, first_run_from, progress) if d is not None else None
+                m = update_minutes(yh, mw, sym, minute_end, first_run_from, progress) if d is not None else None
+                mf.flush()
+                os.fsync(mf.fileno())
+                save_progress(progress)  # only after the bars are safely on disk
             except Exception as e:  # one bad instrument must not stop the run
                 log(f"  {sym}: unexpected error {type(e).__name__}: {e}")
                 d = m = None
