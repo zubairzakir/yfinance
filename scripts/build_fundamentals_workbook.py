@@ -15,6 +15,7 @@ Usage:
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
@@ -263,7 +264,7 @@ def write_sheet(wb, title, columns, rows, formats=None, widths=None, table_name=
             v = row.get(c)
             if isinstance(v, str) and v.startswith("="):
                 v = v.format(r=i)
-            if isinstance(v, float) and v != v:  # NaN
+            if isinstance(v, float) and not math.isfinite(v):  # NaN / Yahoo's "Infinity"
                 v = None
             cell = ws.cell(i, j, v)
             cell.font = FONT
@@ -389,6 +390,11 @@ README = [
     ("Future dividends", "Shown only once a company has announced them ('Ex-Div Date Upcoming?' = Yes)."),
     ("Ex-div dates", "Dividend History uses the exchange's ex-date. Yahoo occasionally misses or duplicates one."),
     ("Earnings history", "Yahoo's free data covers only the last 4 quarters and 4 years."),
+    ("P/E ratios", "From Yahoo. For London stocks that report in USD or EUR (e.g. Anglo American, Vodafone) "
+                   "Yahoo divides a GBP price by USD/EUR earnings, so P/E is only approximate. Forward P/E for "
+                   "some small companies is clearly wrong (e.g. thousands) where Yahoo's forward EPS is near zero."),
+    ("Fund category", "Yahoo has almost no category data for UK/European (UCITS) ETFs; fund family, size "
+                      "and fees are more complete."),
     ("Funds / ETFs", "No sector, earnings or HQ; fund family, category, size and fees where Yahoo has them."),
     ("Not found", "Instruments not on Yahoo (mostly delisted) appear in Overview with no data."),
 ]
@@ -429,24 +435,27 @@ def main():
                 {"Ex-Dividend Date": DATE, "Amount (Price Unit)": MONEY4}, {"Name": 34, "Price Unit": 18},
                 table_name="DividendHistory")
 
-    # Dividends by Year: SUMIFS over the Dividend History table.
-    n = len(hist) + 1
+    # Dividends by Year: SUMIFS over each symbol's own block of Dividend History
+    # rows (the sheet is grouped by symbol), so each formula scans ~50 rows
+    # rather than all ~26,000.
+    blocks = {}
+    for i, h in enumerate(hist, start=2):
+        first, _ = blocks.get(h["Yahoo Symbol"], (i, i))
+        blocks[h["Yahoo Symbol"]] = (first, i)
     years = list(range(args.first_year, TODAY.year + 1))
-    by_year, seen = [], set()
-    for o in overview:
-        sym = o["Yahoo Symbol"]
-        if sym and sym not in seen and divs.get(sym):
-            seen.add(sym)
-            row = {"Yahoo Symbol": sym, "Name": o["Yahoo Name"], "Price Unit": o["Price Unit"]}
-            for y in years:
-                row[str(y)] = (f"=SUMIFS('Dividend History'!$D$2:$D${n},'Dividend History'!$A$2:$A${n},$A{{r}},"
-                               f"'Dividend History'!$F$2:$F${n},{y})")
-            by_year.append(row)
+    by_year = []
+    for sym, (a, b) in blocks.items():
+        o = next(x for x in overview if x["Yahoo Symbol"] == sym)
+        row = {"Yahoo Symbol": sym, "Name": o["Yahoo Name"], "Price Unit": o["Price Unit"]}
+        for y in years:
+            row[str(y)] = f"=SUMIFS('Dividend History'!$D${a}:$D${b},'Dividend History'!$F${a}:$F${b},{y})"
+        by_year.append(row)
     write_sheet(wb, "Dividends by Year", ["Yahoo Symbol", "Name", "Price Unit"] + [str(y) for y in years], by_year,
                 {str(y): "#,##0.00;-#,##0.00;-" for y in years}, {"Name": 30, "Price Unit": 16},
                 table_name="DividendsByYear",
-                note=f"Total dividends per calendar year, in each instrument's Price Unit. "
-                     f"Years before {args.first_year} are in Dividend History.")
+                note=f"Total dividends per calendar year, in each instrument's Price Unit. Years before "
+                     f"{args.first_year} are in Dividend History. Formulas point at each symbol's rows there, "
+                     f"so don't re-sort the Dividend History sheet.")
 
     write_sheet(wb, "Earnings Quarterly", ["Yahoo Symbol", "Name", "Quarter", "Fiscal Quarter", "Period End",
                                            "EPS Actual", "EPS Estimate", "EPS Difference", "EPS Surprise %",
