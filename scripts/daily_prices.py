@@ -1,28 +1,33 @@
-"""Append each completed trading day's prices to one CSV.
+"""Daily run: official daily prices plus 1-minute bars for every listed instrument.
 
 Reads the instruments from Tickers_4Oct26_updated.xlsx (rows with Status
-"Listed") in the same folder, and appends one row per instrument per trading
-day to daily_prices.csv: open, high, low, close, adjusted close, volume,
-dividend, split, and change from the previous close.
+"Listed") in the same folder, and for each one appends:
 
-Each run picks up where the last one stopped. For every instrument it adds
-the trading days whose session closed after the last day already in the
-file, up to 30 minutes before now (giving Yahoo time to finalise the day).
-On the very first run, an instrument gets the sessions that closed in the
-last 24 hours. So nothing is skipped or written twice, even if a run is
-late, missed, or interrupted.
+  daily_prices.csv        One row per completed trading day: Yahoo's official
+                          open, high, low, close, adjusted close and volume
+                          (including auction volume), dividend, split, and
+                          change from the previous close.
+  minute/<SYMBOL>.csv     Every 1-minute bar, including pre/post-market.
+
+Each run continues from the last day / minute already saved for each
+instrument, up to 30 minutes before now (Yahoo delays some exchanges). On the
+first run an instrument gets the last 24 hours. So late, missed or interrupted
+runs neither skip nor duplicate anything - but Yahoo only keeps about 30 days
+of 1-minute data, so run at least every few weeks to keep minute history whole.
 
 Usage (from the folder holding the spreadsheet):
-    python daily_prices.py                  # normal daily run
-    python daily_prices.py --since 2026-10-01   # first run: also backfill from a date
+    python daily_prices.py
+    python daily_prices.py --since 2026-10-01   # first run: start from a date
 """
 
 import argparse
 import csv
 import datetime as dt
+import json
 import os
 import sys
 import time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -30,14 +35,20 @@ import requests
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPREADSHEET = os.path.join(HERE, "Tickers_4Oct26_updated.xlsx")
 OUTPUT = os.path.join(HERE, "daily_prices.csv")
+MINUTE_DIR = os.path.join(HERE, "minute")
 LOG = os.path.join(HERE, "daily_prices.log")
+LOCK = os.path.join(HERE, ".daily_prices.lock")
 CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{}"
 SETTLE = dt.timedelta(minutes=30)
 FIRST_RUN_LOOKBACK = dt.timedelta(hours=24)
+MINUTE_HISTORY = dt.timedelta(days=29)   # Yahoo keeps ~30 days of 1-minute bars
+MINUTE_CHUNK = dt.timedelta(days=7)      # and serves at most ~7 days per request
+UTC = dt.timezone.utc
 
 COLUMNS = ["Trading Date", "Yahoo Symbol", "Name", "Exchange", "Currency", "Price Unit",
            "Open", "High", "Low", "Close", "Adj Close", "Volume", "Previous Close", "Change", "Change %",
            "Dividend", "Stock Split", "Session Close (UTC)", "Added At"]
+MINUTE_COLUMNS = ["Time (UTC)", "Exchange Time", "Open", "High", "Low", "Close", "Volume"]
 
 
 def log(msg):
@@ -50,21 +61,25 @@ def log(msg):
 class Yahoo:
     def __init__(self, min_interval=1.0):
         self.s = requests.Session()
-        self.s.headers["User-Agent"] = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+        # A plain identifier: Yahoo refused a full browser string in testing.
+        self.s.headers["User-Agent"] = "Mozilla/5.0"
         self.min_interval = min_interval
         self.last = 0.0
         self.rate_limited = False
+        self.requests = 0
 
-    def daily(self, symbol, start):
-        params = {"period1": int(start.timestamp()), "period2": int(time.time()),
-                  "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true"}
+    def chart(self, symbol, start, end, interval):
+        """Yahoo chart data, or None if unavailable. Sets rate_limited if Yahoo kept refusing."""
+        params = {"period1": int(start.timestamp()), "period2": int(end.timestamp()), "interval": interval,
+                  "events": "div,splits", "includeAdjustedClose": "true",
+                  "includePrePost": "true" if interval != "1d" else "false"}
         backoff = 30
         for _ in range(4):
             wait = self.last + self.min_interval - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
             self.last = time.monotonic()
+            self.requests += 1
             try:
                 r = self.s.get(CHART_URL.format(symbol), params=params, timeout=30)
             except requests.RequestException as e:
@@ -88,6 +103,8 @@ class Yahoo:
         return None
 
 
+# ---------------------------------------------------------------- daily bars
+
 def sessions(res):
     """Yield (session_close_utc, trading_date, row_values) for each daily bar."""
     meta = res.get("meta", {})
@@ -97,27 +114,31 @@ def sessions(res):
     reg = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
     length = (reg.get("end", 0) - reg.get("start", 0)) or 8 * 3600
     offset = reg.get("gmtoffset", meta.get("gmtoffset", 0))
+
+    def local_date(t):
+        return (dt.datetime.fromtimestamp(int(t), UTC) + dt.timedelta(seconds=offset)).date()
+
     events = res.get("events", {})
-    divs = {int(k): v["amount"] for k, v in events.get("dividends", {}).items()}
-    splits = {int(k): v["numerator"] / v["denominator"] for k, v in events.get("splits", {}).items()}
+    divs, splits = {}, {}
+    for k, v in events.get("dividends", {}).items():
+        divs[local_date(k)] = divs.get(local_date(k), 0) + v["amount"]
+    for k, v in events.get("splits", {}).items():
+        splits[local_date(k)] = v["numerator"] / v["denominator"]
     for i, t in enumerate(ts):
         close = q.get("close", [None])[i]
         if close is None:
             continue
-        start = dt.datetime.fromtimestamp(t, dt.timezone.utc)
-        date = (start + dt.timedelta(seconds=offset)).date()
-        # Dividend/split events are stamped at the session start or local midnight; match by date.
-        div = sum(a for k, a in divs.items() if (dt.datetime.fromtimestamp(k, dt.timezone.utc) + dt.timedelta(seconds=offset)).date() == date)
-        spl = next((r for k, r in splits.items() if (dt.datetime.fromtimestamp(k, dt.timezone.utc) + dt.timedelta(seconds=offset)).date() == date), None)
+        start = dt.datetime.fromtimestamp(t, UTC)
+        date = local_date(t)
         yield start + dt.timedelta(seconds=length), date, {
             "Open": q.get("open", [None])[i], "High": q.get("high", [None])[i], "Low": q.get("low", [None])[i],
             "Close": close, "Adj Close": adj[i], "Volume": q.get("volume", [None])[i],
-            "Dividend": div or None, "Stock Split": spl,
+            "Dividend": divs.get(date), "Stock Split": splits.get(date),
         }
 
 
 def last_dates():
-    """Latest trading date already in the CSV, per symbol."""
+    """Latest trading date and close already in daily_prices.csv, per symbol."""
     if not os.path.exists(OUTPUT):
         return {}
     df = pd.read_csv(OUTPUT, usecols=["Trading Date", "Yahoo Symbol", "Close"])
@@ -130,73 +151,194 @@ def r6(x):
     return round(x, 6) if isinstance(x, float) else x
 
 
+def update_daily(yh, writer, row, have, cutoff, first_run_from, added_at):
+    """Append new completed sessions for one instrument. Returns rows added, or None on failure."""
+    sym = row["Yahoo Symbol"]
+    last_date, prev_close = have.get(sym, (None, None))
+    since = dt.datetime.combine(last_date, dt.time(), UTC) if last_date else first_run_from
+    # A few extra days so the first new row has a previous close.
+    res = yh.chart(sym, since - dt.timedelta(days=10), dt.datetime.now(UTC), "1d")
+    if res is None:
+        return None
+    added = 0
+    for close_utc, date, v in sessions(res):
+        if close_utc > cutoff:
+            continue  # session still open or just closed - the next run gets it
+        if (date > last_date) if last_date else (close_utc > first_run_from):
+            change = v["Close"] - prev_close if prev_close else None
+            writer.writerow({
+                "Trading Date": date.isoformat(), "Yahoo Symbol": sym, "Name": row["Yahoo Name"],
+                "Exchange": row["Exchange"], "Currency": row["Currency"], "Price Unit": row["Price Unit"],
+                **{c: r6(v[c]) for c in ("Open", "High", "Low", "Close", "Adj Close", "Volume",
+                                         "Dividend", "Stock Split")},
+                "Previous Close": r6(prev_close), "Change": r6(change),
+                "Change %": r6(change / prev_close) if change is not None and prev_close else None,
+                "Session Close (UTC)": close_utc.strftime("%Y-%m-%d %H:%M"), "Added At": added_at,
+            })
+            added += 1
+        prev_close = v["Close"]
+    return added
+
+
+# --------------------------------------------------------------- minute bars
+
+def minute_path(sym):
+    return os.path.join(MINUTE_DIR, f"{sym}.csv")
+
+
+PROGRESS = os.path.join(MINUTE_DIR, "_fetched_up_to.json")
+
+
+def load_progress():
+    """UTC time up to which each symbol's minute bars have been fetched."""
+    try:
+        with open(PROGRESS) as f:
+            return {k: dt.datetime.fromisoformat(v) for k, v in json.load(f).items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_progress(progress):
+    with open(PROGRESS + ".tmp", "w") as f:
+        json.dump({k: v.isoformat() for k, v in progress.items()}, f, indent=0)
+    os.replace(PROGRESS + ".tmp", PROGRESS)
+
+
+def last_minute(path):
+    """UTC time of the last bar saved in a minute file, or None."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - 4096))
+        lines = [ln for ln in f.read().decode("utf-8", "ignore").splitlines() if ln.strip()]
+    try:
+        return dt.datetime.strptime(lines[-1].split(",")[0], "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
+    except (ValueError, IndexError):
+        return None  # only a header so far
+
+
+def update_minutes(yh, sym, end, first_run_from, progress):
+    """Append complete 1-minute bars up to `end` for one instrument.
+    Returns bars added, or None if a request failed (the rest is retried next run)."""
+    path = minute_path(sym)
+    last = progress.get(sym)
+    if last is None:
+        bar = last_minute(path)  # progress file lost: fall back to the file itself
+        last = bar + dt.timedelta(minutes=1) if bar else None
+    start = last or first_run_from
+    oldest = end - MINUTE_HISTORY
+    if start < oldest:
+        if start != first_run_from:
+            log(f"  {sym}: minute data from {start:%Y-%m-%d %H:%M} to {oldest:%Y-%m-%d %H:%M} UTC "
+                f"is no longer on Yahoo (over 30 days since the last run) - continuing from there")
+        start = oldest
+    if start >= end:
+        return 0
+    added = 0
+    new_file = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(MINUTE_COLUMNS)
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + MINUTE_CHUNK, end)
+            res = yh.chart(sym, chunk_start, chunk_end, "1m")
+            if res is None:
+                return None
+            tz = ZoneInfo(res.get("meta", {}).get("exchangeTimezoneName") or "UTC")
+            q = (res.get("indicators", {}).get("quote") or [{}])[0]
+            rows = {}
+            for i, t in enumerate(res.get("timestamp") or []):
+                bar = dt.datetime.fromtimestamp(t, UTC)
+                close = q.get("close", [None])[i]
+                # Only whole minutes inside this window; Yahoo can include a forming bar.
+                if close is None or bar < chunk_start or bar + dt.timedelta(minutes=1) > chunk_end:
+                    continue
+                rows[t] = [bar.strftime("%Y-%m-%d %H:%M"), bar.astimezone(tz).strftime("%Y-%m-%d %H:%M"),
+                           r6(q["open"][i]), r6(q["high"][i]), r6(q["low"][i]), r6(close), q["volume"][i]]
+            for t in sorted(rows):
+                w.writerow(rows[t])
+            added += len(rows)
+            f.flush()
+            progress[sym] = chunk_start = chunk_end
+            save_progress(progress)
+    return added
+
+
+# ---------------------------------------------------------------------- main
+
 def main(argv=None, now=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--since", help="For instruments not yet in the file, start from this date (YYYY-MM-DD) "
+    ap.add_argument("--since", help="For instruments not yet saved, start from this date (YYYY-MM-DD) "
                                     "instead of the last 24 hours")
     ap.add_argument("--min-interval", type=float, default=1.0, help="Seconds between requests (default 1)")
     args = ap.parse_args(argv)
 
     if not os.path.exists(SPREADSHEET):
         sys.exit(f"Can't find {SPREADSHEET} - put this script in the same folder as the spreadsheet.")
+    if os.path.exists(LOCK) and time.time() - os.path.getmtime(LOCK) < 3 * 3600:
+        sys.exit("Another run is still in progress (or crashed within the last 3 hours). "
+                 f"If you're sure none is running, delete {LOCK} and try again.")
+    open(LOCK, "w").close()
+    try:
+        run(args, now)
+    finally:
+        os.remove(LOCK)
+
+
+def run(args, now):
     inst = pd.read_excel(SPREADSHEET)
     inst = inst[inst["Status"] == "Listed"].drop_duplicates("Yahoo Symbol")
+    os.makedirs(MINUTE_DIR, exist_ok=True)
 
-    now = now or dt.datetime.now(dt.timezone.utc)
+    now = now or dt.datetime.now(UTC)
     cutoff = now - SETTLE
-    first_run_from = (dt.datetime.fromisoformat(args.since).replace(tzinfo=dt.timezone.utc)
+    minute_end = cutoff.replace(second=0, microsecond=0)
+    first_run_from = (dt.datetime.fromisoformat(args.since).replace(tzinfo=UTC)
                       if args.since else now - FIRST_RUN_LOOKBACK)
     have = last_dates()
+    progress = load_progress()
     added_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    log(f"Run started: {len(inst)} instruments, "
-        f"{'continuing from previous runs' if have else 'first run'}, data up to {cutoff:%Y-%m-%d %H:%M} UTC")
+    log(f"Run started: {len(inst)} instruments, {'continuing' if have else 'first run'}, "
+        f"data up to {cutoff:%Y-%m-%d %H:%M} UTC")
 
     yh = Yahoo(args.min_interval)
     new_file = not os.path.exists(OUTPUT)
-    n_rows, failed, blocked, t0 = 0, [], 0, time.monotonic()
+    days = minutes = blocked = 0
+    failed, t0 = [], time.monotonic()
     with open(OUTPUT, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS)
         if new_file:
             w.writeheader()
         for k, (_, row) in enumerate(inst.iterrows(), 1):
             sym = row["Yahoo Symbol"]
-            last_date, prev_close = have.get(sym, (None, None))
-            # Fetch a few extra days so the first new row has a previous close.
-            since = (dt.datetime.combine(last_date, dt.time(), dt.timezone.utc) if last_date else first_run_from)
-            res = yh.daily(sym, since - dt.timedelta(days=10))
-            if res is None:
+            try:
+                d = update_daily(yh, w, row, have, cutoff, first_run_from, added_at)
+                f.flush()
+                m = update_minutes(yh, sym, minute_end, first_run_from, progress) if d is not None else None
+            except Exception as e:  # one bad instrument must not stop the run
+                log(f"  {sym}: unexpected error {type(e).__name__}: {e}")
+                d = m = None
+            days += d or 0
+            minutes += m or 0
+            if d is None or m is None:
                 failed.append(sym)
                 blocked = blocked + 1 if yh.rate_limited else 0
                 if blocked >= 3:
                     log("Yahoo is refusing requests from this connection. Stopping - nothing is lost; "
                         "run again in an hour or so and it will carry on from here.")
                     break
-                continue
-            blocked = 0
-            for close_utc, date, v in sessions(res):
-                if close_utc > cutoff:
-                    continue  # session still open or just closed - next run gets it
-                is_new = date > last_date if last_date else close_utc > first_run_from
-                if is_new:
-                    change = v["Close"] - prev_close if prev_close else None
-                    w.writerow({
-                        "Trading Date": date.isoformat(), "Yahoo Symbol": sym, "Name": row["Yahoo Name"],
-                        "Exchange": row["Exchange"], "Currency": row["Currency"], "Price Unit": row["Price Unit"],
-                        **{c: r6(v[c]) for c in ("Open", "High", "Low", "Close", "Adj Close", "Volume",
-                                                 "Dividend", "Stock Split")},
-                        "Previous Close": r6(prev_close), "Change": r6(change),
-                        "Change %": r6(change / prev_close) if change is not None and prev_close else None,
-                        "Session Close (UTC)": close_utc.strftime("%Y-%m-%d %H:%M"), "Added At": added_at,
-                    })
-                    n_rows += 1
-                prev_close = v["Close"]
-            f.flush()
+            else:
+                blocked = 0
             if k % 50 == 0:
-                log(f"  {k}/{len(inst)} done, {n_rows} rows added")
+                log(f"  {k}/{len(inst)} done: {days} daily rows, {minutes:,} minute bars")
 
-    log(f"Run finished in {time.monotonic() - t0:.0f}s: {n_rows} rows added to {os.path.basename(OUTPUT)}")
+    log(f"Run finished in {(time.monotonic() - t0) / 60:.0f} min ({yh.requests} requests): "
+        f"{days} daily rows, {minutes:,} minute bars added")
     if failed:
-        log(f"No data this run for {len(failed)}: {' '.join(failed)} (they'll be retried next run)")
+        log(f"Incomplete this run for {len(failed)}: {' '.join(failed)} (they'll catch up next run)")
 
 
 if __name__ == "__main__":
