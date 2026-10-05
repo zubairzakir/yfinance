@@ -47,7 +47,7 @@ UTC = dt.timezone.utc
 
 COLUMNS = ["Trading Date", "Yahoo Symbol", "Name", "Exchange", "Currency", "Price Unit",
            "Open", "High", "Low", "Close", "Adj Close", "Volume", "Previous Close", "Change", "Change %",
-           "Dividend", "Stock Split", "Session Close (UTC)", "Added At"]
+           "Dividend", "Stock Split", "Session Open (UTC)", "Session Close (UTC)", "Added At"]
 MINUTE_COLUMNS = ["Time (UTC)", "Exchange Time", "Open", "High", "Low", "Close", "Volume"]
 
 
@@ -106,7 +106,7 @@ class Yahoo:
 # ---------------------------------------------------------------- daily bars
 
 def sessions(res):
-    """Yield (session_close_utc, trading_date, row_values) for each daily bar."""
+    """Yield (session_open_utc, session_close_utc, trading_date, row_values) for each daily bar."""
     meta = res.get("meta", {})
     ts = res.get("timestamp") or []
     q = (res.get("indicators", {}).get("quote") or [{}])[0]
@@ -130,7 +130,7 @@ def sessions(res):
             continue
         start = dt.datetime.fromtimestamp(t, UTC)
         date = local_date(t)
-        yield start + dt.timedelta(seconds=length), date, {
+        yield start, start + dt.timedelta(seconds=length), date, {
             "Open": q.get("open", [None])[i], "High": q.get("high", [None])[i], "Low": q.get("low", [None])[i],
             "Close": close, "Adj Close": adj[i], "Volume": q.get("volume", [None])[i],
             "Dividend": divs.get(date), "Stock Split": splits.get(date),
@@ -161,7 +161,7 @@ def update_daily(yh, writer, row, have, cutoff, first_run_from, added_at):
     if res is None:
         return None
     added = 0
-    for close_utc, date, v in sessions(res):
+    for open_utc, close_utc, date, v in sessions(res):
         if close_utc > cutoff:
             continue  # session still open or just closed - the next run gets it
         if (date > last_date) if last_date else (close_utc > first_run_from):
@@ -173,6 +173,7 @@ def update_daily(yh, writer, row, have, cutoff, first_run_from, added_at):
                                          "Dividend", "Stock Split")},
                 "Previous Close": r6(prev_close), "Change": r6(change),
                 "Change %": r6(change / prev_close) if change is not None and prev_close else None,
+                "Session Open (UTC)": open_utc.strftime("%Y-%m-%d %H:%M"),
                 "Session Close (UTC)": close_utc.strftime("%Y-%m-%d %H:%M"), "Added At": added_at,
             })
             added += 1
